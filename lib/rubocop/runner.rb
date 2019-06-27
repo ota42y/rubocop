@@ -17,6 +17,41 @@ module RuboCop
       end
     end
 
+    class InspectResult
+      attr_accessor :offenses, :errors, :warnings
+
+      def initialize
+        @offenses = []
+        @errors = []
+        @warnings = []
+      end
+    end
+
+    class ProcessResult
+      class << self
+        def build_error_result(filepath, error)
+          ProcessResult.new(filepath, nil, false ,error)
+        end
+
+        def build_succeed_result(filepath, inspect_result, passed)
+          ProcessResult.new(filepath, inspect_result, passed, nil)
+        end
+      end
+
+      attr_accessor :filepath, :inspect_result, :passed, :error
+
+      def initialize(filepath, inspect_result, passed, error)
+        @filepath = filepath
+        @inspect_result = inspect_result
+        @passed = passed
+        @error = error
+      end
+
+      def error_file?
+        !@error.nil?
+      end
+    end
+
     MAX_ITERATIONS = 200
 
     attr_reader :errors, :warnings
@@ -35,7 +70,6 @@ module RuboCop
       if @options[:list_target_files]
         list_files(target_files)
       else
-        warm_cache(target_files) if @options[:parallel]
         inspect_files(target_files)
       end
     rescue Interrupt
@@ -66,11 +100,21 @@ module RuboCop
     end
 
     def inspect_files(files)
-      inspected_files = []
-
       formatter_set.started(files)
 
-      each_inspected_file(files) { |file| inspected_files << file }
+      conductor = InspectConductor.conductor_class(@options[:parallel]).new(files, formatter_set, @options[:fail_fast])
+      conductor.run_inspect(&:process_file)
+
+      inspected_files = conductor.inspected_files
+      @errors = conductor.errors
+      @warnings = conductor.warnings
+
+      unless conductor.error_results.empty?
+        # TODO: show first only...
+        raise conductor.error_results.first.error
+      end
+
+      conductor.all_passed
     ensure
       # OPTIMIZE: Calling `ResultCache.cleanup` takes time. This optimization
       # mainly targets editors that integrates RuboCop. When RuboCop is run
@@ -80,21 +124,6 @@ module RuboCop
       end
       formatter_set.finished(inspected_files.freeze)
       formatter_set.close_output_files
-    end
-
-    def each_inspected_file(files)
-      files.reduce(true) do |all_passed, file|
-        offenses = process_file(file)
-        yield file
-
-        if offenses.any? { |o| considered_failure?(o) }
-          break false if @options[:fail_fast]
-
-          next false
-        end
-
-        all_passed
-      end
     end
 
     def list_files(paths)
@@ -107,43 +136,46 @@ module RuboCop
       puts "Scanning #{file}" if @options[:debug]
       file_started(file)
 
-      offenses = file_offenses(file)
+      result = file_offenses(file)
       if @options[:display_only_fail_level_offenses]
-        offenses = offenses.select { |o| considered_failure?(o) }
+        result.offenses = result.offenses.select { |o| considered_failure?(o) }
       end
-      formatter_set.file_finished(file, offenses)
-      offenses
+
+      passed = result.offenses.any?(&:considered_failure?)
+      ProcessResult.build_succeed_result(file, result, passed)
     rescue InfiniteCorrectionLoop => e
-      formatter_set.file_finished(file, e.offenses.compact.sort.freeze)
-      raise
+      ProcessResult.build_error_result(file, e)
     end
 
     def file_offenses(file)
       file_offense_cache(file) do
         source = get_processed_source(file)
-        source, offenses = do_inspection_loop(file, source)
-        add_unneeded_disables(file, offenses.compact.sort, source)
+        source, result = do_inspection_loop(file, source)
+        result.offenses = add_unneeded_disables(file, result.offenses.compact.sort, source)
+        result
       end
     end
 
     def file_offense_cache(file)
       cache = ResultCache.new(file, @options, @config_store) if cached_run?
       if cache&.valid?
-        offenses = cache.load
+        result = InspectResult.new
+        result.offenses = cache.load
+
         # If we're running --auto-correct and the cache says there are
         # offenses, we need to actually inspect the file. If the cache shows no
         # offenses, we're good.
-        real_run_needed = @options[:auto_correct] && offenses.any?
+        real_run_needed = @options[:auto_correct] && result.offenses.any?
       else
         real_run_needed = true
       end
 
       if real_run_needed
-        offenses = yield
-        save_in_cache(cache, offenses)
+        result = yield
+        save_in_cache(cache, result.offenses)
       end
 
-      offenses
+      result
     end
 
     def add_unneeded_disables(file, offenses, source)
@@ -212,6 +244,8 @@ module RuboCop
     end
 
     def do_inspection_loop(file, processed_source)
+      r = InspectResult.new
+
       offenses = []
 
       # When running with --auto-correct, we need to inspect the file (which
@@ -222,7 +256,9 @@ module RuboCop
         # The offenses that couldn't be corrected will be found again so we
         # only keep the corrected ones in order to avoid duplicate reporting.
         offenses.select!(&:corrected?)
-        new_offenses, updated_source_file = inspect_file(processed_source)
+        new_offenses, updated_source_file, e, w = inspect_file(processed_source)
+        r.errors.concat(e)
+        r.warnings.concat(w)
         offenses.concat(new_offenses).uniq!
 
         # We have to reprocess the source to pickup the changes. Since the
@@ -233,7 +269,8 @@ module RuboCop
         processed_source = get_processed_source(file)
       end
 
-      [processed_source, offenses]
+      r.offenses = offenses
+      [processed_source, r]
     end
 
     def iterate_until_no_changes(source, offenses)
@@ -275,9 +312,9 @@ module RuboCop
       config = @config_store.for(processed_source.path)
       team = Cop::Team.new(mobilized_cop_classes(config), config, @options)
       offenses = team.inspect_file(processed_source)
-      @errors.concat(team.errors)
-      @warnings.concat(team.warnings)
-      [offenses, team.updated_source_file?]
+      #@errors.concat(team.errors)
+      #@warnings.concat(team.warnings)
+      [offenses, team.updated_source_file?, team.errors, team.warnings]
     end
 
     def mobilized_cop_classes(config)

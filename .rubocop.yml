@@ -98,3 +98,6 @@ RSpec/MessageSpies:
 
 RSpec/NestedGroups:
   Max: 7
+
+Layout/SpaceAroundBlockParameters:
+  EnforcedStyleInsidePipes: space
